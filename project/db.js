@@ -35,7 +35,7 @@ async function connect() {
         await client.connect();
 
 
-        database = client.db("astana_guide");
+        database = client.db("Astana_guide");
 
 
         console.log("Облачная база данных подключена");
