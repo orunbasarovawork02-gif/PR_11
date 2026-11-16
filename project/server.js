@@ -1,127 +1,83 @@
+require("dotenv").config();
+
+
 const express = require("express");
 const path = require("path");
 const db = require("./db");
 const bcrypt = require("bcrypt");
 const session = require("express-session");
 
-require("dotenv").config({
-    path: path.join(__dirname, ".env")
-});
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+
+// Настройки Render
+if (process.env.NODE_ENV === "production") {
+    app.set("trust proxy", 1);
+}
+
+
+// Настройки EJS
 app.set("view engine", "ejs");
 app.set("views", path.join(__dirname, "views"));
 
+
+// Подключение файлов
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
+
+// Настройки сессии
 app.use(session({
-    secret: process.env.SESSION_SECRET || "temporary-secret-change-in-env",
+    name: "astana-guide.sid",
+    secret: process.env.SESSION_SECRET || "local-secret",
     resave: false,
     saveUninitialized: false,
     cookie: {
         httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "lax",
         maxAge: 2 * 60 * 60 * 1000
     }
 }));
 
+
+// Проверка авторизации
 app.use((req, res, next) => {
     res.locals.isAdmin = Boolean(req.session.isAdmin);
     next();
 });
 
+
+// Защита страниц администратора
 function requireAuth(req, res, next) {
-    if (req.session.isAdmin) return next();
-    return res.redirect("/login");
+    if (req.session.isAdmin) {
+        return next();
+    }
+    res.redirect("/login");
 }
 
-function requireApiAuth(req, res, next) {
-    if (req.session.isAdmin) return next();
-    return res.status(401).json({
-        error: "Доступ запрещён. Войдите как администратор."
+
+// Защита REST API
+function apiRequireAuth(req, res, next) {
+    if (req.session.isAdmin) {
+        return next();
+    }
+
+
+    res.status(401).json({
+        message: "Необходимо войти как администратор."
     });
 }
 
-function parseId(value) {
-    const id = Number(value);
-    return Number.isInteger(id) && id > 0 ? id : null;
-}
 
-function escapeRegex(value) {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+// ==========================================
+// ГЛАВНАЯ СТРАНИЦА
+// ==========================================
 
-function validatePlace(body) {
-    const title = typeof body.title === "string" ? body.title.trim() : "";
-    const description = typeof body.description === "string"
-        ? body.description.trim()
-        : "";
-    const category = typeof body.category === "string"
-        ? body.category.trim()
-        : "";
-    const time = typeof body.time === "string" ? body.time.trim() : "";
-    const image = typeof body.image === "string" ? body.image.trim() : "";
 
-    const errors = [];
-    if (title.length < 8) errors.push("Название должно содержать минимум 8 символов.");
-    if (description.length < 10) errors.push("Описание должно содержать минимум 10 символов.");
-    if (!category) errors.push("Укажите категорию.");
-    if (!time) errors.push("Укажите время посещения.");
-
-    return { errors, place: { title, description, category, time, image } };
-}
-
-async function getNextPlaceId(collection) {
-    const lastPlace = await collection.find({}).sort({ id: -1 }).limit(1).toArray();
-    return lastPlace.length > 0 && Number.isInteger(lastPlace[0].id)
-        ? lastPlace[0].id + 1
-        : 1;
-}
-
-// Приводим документы из старой версии PR-8 к единому виду:
-// добавляем id и переносим name в title, если это необходимо.
-async function migratePlacesSchema() {
-    const collection = db.getCollection("places");
-    const places = await collection.find({}).sort({ _id: 1 }).toArray();
-
-    const usedIds = new Set(
-        places.map(place => place.id)
-            .filter(id => Number.isInteger(id) && id > 0)
-    );
-    let nextId = usedIds.size > 0 ? Math.max(...usedIds) + 1 : 1;
-    const seenIds = new Set();
-
-    for (const place of places) {
-        let id = Number.isInteger(place.id) && place.id > 0 ? place.id : null;
-
-        if (id === null || seenIds.has(id)) {
-            while (usedIds.has(nextId) || seenIds.has(nextId)) nextId += 1;
-            id = nextId;
-            nextId += 1;
-        }
-        seenIds.add(id);
-
-        const title = typeof place.title === "string" && place.title.trim()
-            ? place.title.trim()
-            : (place.name || "Без названия");
-
-        const update = {};
-        if (place.id !== id) update.id = id;
-        if (place.title !== title) update.title = title;
-        if (place.image === "Nur Alem.jpg") update.image = "Nur alem.jpg";
-
-        if (Object.keys(update).length > 0) {
-            await collection.updateOne({ _id: place._id }, { $set: update });
-        }
-    }
-
-    console.log("Проверена структура достопримечательностей:", places.length);
-}
-
-// Главная страница
 app.get("/", async (req, res) => {
     try {
         const places = await db.getCollection("places")
@@ -129,183 +85,46 @@ app.get("/", async (req, res) => {
             .sort({ id: 1 })
             .toArray();
 
+
         res.render("index", {
-            title: "ASTANA GUIDE — Тур-гид по Астане",
+            title: "Тур-гид по Астане",
             places
         });
+
+
     } catch (error) {
         console.error("Ошибка главной страницы:", error);
+
+
         res.status(500).render("error", {
             message: "Не удалось загрузить достопримечательности."
         });
     }
 });
 
-// ========================= REST API =========================
 
-// GET /api/places?page=1&limit=10
-// GET /api/places?category=Прогулка
-// GET /api/places?q=мост
-// GET /api/places?time=1–2 часа
-app.get("/api/places", async (req, res) => {
-    try {
-        const page = req.query.page === undefined ? 1 : Number(req.query.page);
-        const limit = req.query.limit === undefined ? 10 : Number(req.query.limit);
+// ==========================================
+// АВТОРИЗАЦИЯ
+// ==========================================
 
-        if (!Number.isInteger(page) || page < 1 ||
-            !Number.isInteger(limit) || limit < 1) {
-            return res.status(400).json({
-                error: "Параметры page и limit должны быть положительными целыми числами."
-            });
-        }
-
-        const safeLimit = Math.min(limit, 100);
-        const filter = {};
-
-        if (typeof req.query.category === "string" && req.query.category.trim()) {
-            filter.category = {
-                $regex: `^${escapeRegex(req.query.category.trim())}$`,
-                $options: "i"
-            };
-        }
-
-        if (typeof req.query.time === "string" && req.query.time.trim()) {
-            filter.time = {
-                $regex: escapeRegex(req.query.time.trim()),
-                $options: "i"
-            };
-        }
-
-        const search = typeof req.query.q === "string" ? req.query.q.trim() : "";
-        if (search) {
-            const searchRegex = new RegExp(escapeRegex(search), "i");
-            filter.$or = [
-                { title: searchRegex },
-                { description: searchRegex },
-                { category: searchRegex }
-            ];
-        }
-
-        const collection = db.getCollection("places");
-        const total = await collection.countDocuments(filter);
-        const items = await collection.find(filter)
-            .sort({ id: 1 })
-            .skip((page - 1) * safeLimit)
-            .limit(safeLimit)
-            .toArray();
-
-        return res.status(200).json({
-            total,
-            page,
-            limit: safeLimit,
-            items
-        });
-    } catch (error) {
-        console.error("GET /api/places:", error);
-        return res.status(500).json({
-            error: "Не удалось получить список достопримечательностей."
-        });
-    }
-});
-
-// GET /api/places/:id — получение одной записи
-app.get("/api/places/:id", async (req, res) => {
-    try {
-        const id = parseId(req.params.id);
-        if (id === null) return res.status(400).json({ error: "Некорректный ID." });
-
-        const place = await db.getCollection("places").findOne({ id });
-        if (!place) return res.status(404).json({ error: "Достопримечательность не найдена." });
-
-        return res.status(200).json(place);
-    } catch (error) {
-        console.error("GET /api/places/:id:", error);
-        return res.status(500).json({ error: "Не удалось получить запись." });
-    }
-});
-
-// POST /api/places — добавление (только администратор)
-app.post("/api/places", requireApiAuth, async (req, res) => {
-    try {
-        const { errors, place } = validatePlace(req.body);
-        if (errors.length > 0) {
-            return res.status(400).json({ error: "Проверьте данные.", details: errors });
-        }
-
-        const collection = db.getCollection("places");
-        const newPlace = { id: await getNextPlaceId(collection), ...place };
-        await collection.insertOne(newPlace);
-
-        return res.status(201).json({
-            message: "Достопримечательность успешно добавлена.",
-            item: newPlace
-        });
-    } catch (error) {
-        console.error("POST /api/places:", error);
-        return res.status(500).json({ error: "Не удалось добавить достопримечательность." });
-    }
-});
-
-// PUT /api/places/:id — изменение (только администратор)
-app.put("/api/places/:id", requireApiAuth, async (req, res) => {
-    try {
-        const id = parseId(req.params.id);
-        if (id === null) return res.status(400).json({ error: "Некорректный ID." });
-
-        const { errors, place } = validatePlace(req.body);
-        if (errors.length > 0) {
-            return res.status(400).json({ error: "Проверьте данные.", details: errors });
-        }
-
-        const collection = db.getCollection("places");
-        const result = await collection.updateOne({ id }, { $set: place });
-
-        if (result.matchedCount === 0) {
-            return res.status(404).json({ error: "Достопримечательность не найдена." });
-        }
-
-        const updatedPlace = await collection.findOne({ id });
-        return res.status(200).json({
-            message: "Достопримечательность успешно изменена.",
-            item: updatedPlace
-        });
-    } catch (error) {
-        console.error("PUT /api/places/:id:", error);
-        return res.status(500).json({ error: "Не удалось изменить запись." });
-    }
-});
-
-// DELETE /api/places/:id — удаление (только администратор)
-app.delete("/api/places/:id", requireApiAuth, async (req, res) => {
-    try {
-        const id = parseId(req.params.id);
-        if (id === null) return res.status(400).json({ error: "Некорректный ID." });
-
-        const result = await db.getCollection("places").deleteOne({ id });
-        if (result.deletedCount === 0) {
-            return res.status(404).json({ error: "Достопримечательность не найдена." });
-        }
-
-        return res.status(200).json({
-            message: "Достопримечательность успешно удалена.",
-            id
-        });
-    } catch (error) {
-        console.error("DELETE /api/places/:id:", error);
-        return res.status(500).json({ error: "Не удалось удалить запись." });
-    }
-});
-
-// ====================== АВТОРИЗАЦИЯ ======================
 
 app.get("/login", (req, res) => {
-    if (req.session.isAdmin) return res.redirect("/add");
-    res.render("login", { title: "Вход администратора", error: null });
+    if (req.session.isAdmin) {
+        return res.redirect("/add");
+    }
+
+
+    res.render("login", {
+        title: "Вход администратора",
+        error: null
+    });
 });
+
 
 app.post("/login", async (req, res) => {
     try {
         const { login, password } = req.body;
+
 
         if (!login || !password) {
             return res.status(400).render("login", {
@@ -314,10 +133,14 @@ app.post("/login", async (req, res) => {
             });
         }
 
+
         const correctLogin = login === process.env.ADMIN_LOGIN;
+
+
         const correctPassword = process.env.ADMIN_HASH
             ? await bcrypt.compare(password, process.env.ADMIN_HASH)
             : false;
+
 
         if (!correctLogin || !correctPassword) {
             return res.status(401).render("login", {
@@ -326,48 +149,373 @@ app.post("/login", async (req, res) => {
             });
         }
 
+
         req.session.regenerate((error) => {
             if (error) {
-                console.error("Ошибка создания сессии:", error);
+                console.error(error);
+
+
                 return res.status(500).render("login", {
                     title: "Вход администратора",
                     error: "Не удалось выполнить вход."
                 });
             }
 
+
             req.session.isAdmin = true;
-            req.session.save((saveError) => {
-                if (saveError) {
-                    console.error("Ошибка сохранения сессии:", saveError);
+
+
+            req.session.save((error) => {
+                if (error) {
+                    console.error(error);
+
+
                     return res.status(500).render("login", {
                         title: "Вход администратора",
-                        error: "Не удалось сохранить авторизацию."
+                        error: "Ошибка сохранения авторизации."
                     });
                 }
-                return res.redirect("/add");
+
+
+                res.redirect("/add");
             });
         });
+
+
     } catch (error) {
         console.error("Ошибка авторизации:", error);
-        return res.status(500).render("login", {
+
+
+        res.status(500).render("login", {
             title: "Вход администратора",
             error: "Произошла ошибка при входе."
         });
     }
 });
 
+
+// Выход администратора
 app.post("/logout", (req, res) => {
     req.session.destroy((error) => {
         if (error) {
-            console.error("Ошибка выхода:", error);
-            return res.status(500).send("Не удалось выйти из аккаунта.");
+            return res.status(500).send("Не удалось выйти.");
         }
-        res.clearCookie("connect.sid");
-        return res.redirect("/");
+
+
+        res.clearCookie("astana-guide.sid");
+        res.redirect("/");
     });
 });
 
-// ====================== HTML-СТРАНИЦЫ ======================
+
+// ==========================================
+// REST API — GET
+// ==========================================
+
+
+app.get("/api/places", async (req, res) => {
+    try {
+        const collection = db.getCollection("places");
+
+
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+
+
+        const limit = Math.min(
+            100,
+            Math.max(1, parseInt(req.query.limit) || 10)
+        );
+
+
+        const filter = {};
+
+
+        if (req.query.category) {
+            filter.category = req.query.category;
+        }
+
+
+        const total = await collection.countDocuments(filter);
+
+
+        const items = await collection
+            .find(filter)
+            .sort({ id: 1 })
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .toArray();
+
+
+        res.status(200).json({
+            total,
+            page,
+            limit,
+            items
+        });
+
+
+    } catch (error) {
+        console.error("GET API:", error);
+
+
+        res.status(500).json({
+            message: "Не удалось получить достопримечательности."
+        });
+    }
+});
+
+
+// ==========================================
+// REST API — POST
+// ==========================================
+
+
+app.post("/api/places", apiRequireAuth, async (req, res) => {
+    try {
+        const {
+            title,
+            description,
+            category,
+            time,
+            image
+        } = req.body;
+
+
+        if (
+            typeof title !== "string" ||
+            title.trim().length < 8 ||
+            typeof description !== "string" ||
+            description.trim().length < 10 ||
+            typeof category !== "string" ||
+            !category.trim() ||
+            typeof time !== "string" ||
+            !time.trim()
+        ) {
+            return res.status(400).json({
+                message: "Проверьте заполнение обязательных полей."
+            });
+        }
+
+
+        const collection = db.getCollection("places");
+
+
+        const lastPlace = await collection
+            .find({})
+            .sort({ id: -1 })
+            .limit(1)
+            .toArray();
+
+
+        const newId = lastPlace.length
+            ? lastPlace[0].id + 1
+            : 1;
+
+
+        const newPlace = {
+            id: newId,
+            title: title.trim(),
+            description: description.trim(),
+            category: category.trim(),
+            time: time.trim(),
+            image: typeof image === "string" ? image : ""
+        };
+
+
+        await collection.insertOne(newPlace);
+
+
+        res.status(201).json({
+            message: "Достопримечательность успешно добавлена.",
+            item: newPlace
+        });
+
+
+    } catch (error) {
+        console.error("POST API:", error);
+
+
+        res.status(500).json({
+            message: "Не удалось добавить достопримечательность."
+        });
+    }
+});
+
+
+// ==========================================
+// REST API — PUT
+// ==========================================
+
+
+app.put("/api/places/:id", apiRequireAuth, async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+
+
+        if (!Number.isInteger(id) || id < 1) {
+            return res.status(400).json({
+                message: "Некорректный ID."
+            });
+        }
+
+
+        const {
+            title,
+            description,
+            category,
+            time,
+            image
+        } = req.body;
+
+
+        const updates = {};
+
+
+        if (title !== undefined) {
+            if (typeof title !== "string" || title.trim().length < 8) {
+                return res.status(400).json({
+                    message: "Название должно содержать минимум 8 символов."
+                });
+            }
+
+
+            updates.title = title.trim();
+        }
+
+
+        if (description !== undefined) {
+            if (typeof description !== "string" || description.trim().length < 10) {
+                return res.status(400).json({
+                    message: "Описание должно содержать минимум 10 символов."
+                });
+            }
+
+
+            updates.description = description.trim();
+        }
+
+
+        if (category !== undefined) {
+            if (typeof category !== "string" || !category.trim()) {
+                return res.status(400).json({
+                    message: "Укажите категорию."
+                });
+            }
+
+
+            updates.category = category.trim();
+        }
+
+
+        if (time !== undefined) {
+            if (typeof time !== "string" || !time.trim()) {
+                return res.status(400).json({
+                    message: "Укажите время посещения."
+                });
+            }
+
+
+            updates.time = time.trim();
+        }
+
+
+        if (image !== undefined) {
+            if (typeof image !== "string") {
+                return res.status(400).json({
+                    message: "Некорректное изображение."
+                });
+            }
+
+
+            updates.image = image;
+        }
+
+
+        if (Object.keys(updates).length === 0) {
+            return res.status(400).json({
+                message: "Нет данных для изменения."
+            });
+        }
+
+
+        const result = await db.getCollection("places").updateOne(
+            { id },
+            { $set: updates }
+        );
+
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({
+                message: "Достопримечательность не найдена."
+            });
+        }
+
+
+        res.status(200).json({
+            message: "Достопримечательность успешно изменена."
+        });
+
+
+    } catch (error) {
+        console.error("PUT API:", error);
+
+
+        res.status(500).json({
+            message: "Не удалось изменить достопримечательность."
+        });
+    }
+});
+
+
+// ==========================================
+// REST API — DELETE
+// ==========================================
+
+
+app.delete("/api/places/:id", apiRequireAuth, async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+
+
+        if (!Number.isInteger(id) || id < 1) {
+            return res.status(400).json({
+                message: "Некорректный ID."
+            });
+        }
+
+
+        const result = await db.getCollection("places").deleteOne({
+            id
+        });
+
+
+        if (result.deletedCount === 0) {
+            return res.status(404).json({
+                message: "Достопримечательность не найдена."
+            });
+        }
+
+
+        res.status(200).json({
+            message: "Достопримечательность успешно удалена."
+        });
+
+
+    } catch (error) {
+        console.error("DELETE API:", error);
+
+
+        res.status(500).json({
+            message: "Не удалось удалить достопримечательность."
+        });
+    }
+});
+
+
+// ==========================================
+// ДОБАВЛЕНИЕ ЧЕРЕЗ САЙТ
+// ==========================================
+
 
 app.get("/add", requireAuth, (req, res) => {
     res.render("add", {
@@ -377,122 +525,228 @@ app.get("/add", requireAuth, (req, res) => {
     });
 });
 
-// Добавление через HTML-форму (предыдущая функция PR-8)
+
 app.post("/add", requireAuth, async (req, res) => {
     try {
-        const { errors, place } = validatePlace(req.body);
+        const {
+            title,
+            description,
+            category,
+            time
+        } = req.body;
+
+
+        const errors = [];
+
+
+        if (!title || title.trim().length < 8) {
+            errors.push("Название должно содержать минимум 8 символов.");
+        }
+
+
+        if (!description || description.trim().length < 10) {
+            errors.push("Описание должно содержать минимум 10 символов.");
+        }
+
+
+        if (!category) {
+            errors.push("Выберите категорию.");
+        }
+
+
+        if (!time) {
+            errors.push("Укажите время посещения.");
+        }
+
+
+        const formData = {
+            title,
+            description,
+            category,
+            time
+        };
+
 
         if (errors.length > 0) {
             return res.status(400).render("add", {
                 title: "Добавить достопримечательность",
                 errors,
-                formData: req.body
+                formData
             });
         }
 
+
         const collection = db.getCollection("places");
-        const newPlace = { id: await getNextPlaceId(collection), ...place };
-        await collection.insertOne(newPlace);
-        return res.redirect("/");
+
+
+        const lastPlace = await collection
+            .find({})
+            .sort({ id: -1 })
+            .limit(1)
+            .toArray();
+
+
+        const newId = lastPlace.length
+            ? lastPlace[0].id + 1
+            : 1;
+
+
+        await collection.insertOne({
+            id: newId,
+            title: title.trim(),
+            description: description.trim(),
+            category,
+            time,
+            image: req.body.image || ""
+        });
+
+
+        res.redirect("/");
+
+
     } catch (error) {
-        console.error("Ошибка добавления места:", error);
-        return res.status(500).render("error", {
+        console.error("Ошибка добавления:", error);
+
+
+        res.status(500).render("error", {
             message: "Не удалось добавить достопримечательность."
         });
     }
 });
 
-// Страница редактирования (сама запись сохраняется через PUT API)
-app.get("/edit/:id", requireAuth, async (req, res) => {
-    try {
-        const id = parseId(req.params.id);
-        if (id === null) {
-            return res.status(400).render("error", {
-                message: "Некорректный ID достопримечательности."
-            });
-        }
 
-        const place = await db.getCollection("places").findOne({ id });
-        if (!place) {
-            return res.status(404).render("404", { title: "Страница не найдена" });
-        }
+// ==========================================
+// СТРАНИЦА ДОСТОПРИМЕЧАТЕЛЬНОСТИ
+// ==========================================
 
-        return res.render("edit", {
-            title: "Редактировать достопримечательность",
-            place
-        });
-    } catch (error) {
-        console.error("Ошибка открытия редактирования:", error);
-        return res.status(500).render("error", {
-            message: "Не удалось открыть запись для редактирования."
-        });
-    }
-});
 
 app.get("/place/:id", async (req, res) => {
     try {
-        const id = parseId(req.params.id);
-        if (id === null) {
-            return res.status(400).render("error", {
-                message: "Некорректный ID достопримечательности."
+        const id = Number(req.params.id);
+
+
+        const place = await db.getCollection("places").findOne({
+            id
+        });
+
+
+        if (!place) {
+            return res.status(404).render("404", {
+                title: "Страница не найдена"
             });
         }
 
-        const place = await db.getCollection("places").findOne({ id });
-        if (!place) return res.status(404).render("404", { title: "Страница не найдена" });
 
-        return res.render("place", { title: place.title, place });
+        res.render("place", {
+            title: place.title,
+            place
+        });
+
+
     } catch (error) {
         console.error("Ошибка загрузки места:", error);
-        return res.status(500).render("error", {
+
+
+        res.status(500).render("error", {
             message: "Не удалось загрузить страницу."
         });
     }
 });
 
+
+// ==========================================
+// О ПРОЕКТЕ
+// ==========================================
+
+
 app.get("/about", (req, res) => {
-    res.render("about", { title: "О проекте" });
+    res.render("about", {
+        title: "О проекте"
+    });
 });
+
+
+// ==========================================
+// 404
+// ==========================================
+
 
 app.use((req, res) => {
     if (req.path.startsWith("/api/")) {
-        return res.status(404).json({ error: "API-маршрут не найден." });
+        return res.status(404).json({
+            message: "API-маршрут не найден."
+        });
     }
-    return res.status(404).render("404", { title: "Страница не найдена" });
+
+
+    res.status(404).render("404", {
+        title: "Страница не найдена"
+    });
 });
+
+
+// ==========================================
+// ОБРАБОТКА ОШИБОК
+// ==========================================
+
 
 app.use((error, req, res, next) => {
     console.error("Ошибка сервера:", error);
+
+
     if (req.path.startsWith("/api/")) {
-        return res.status(500).json({ error: "Внутренняя ошибка сервера." });
+        return res.status(500).json({
+            message: "Произошла внутренняя ошибка сервера."
+        });
     }
-    return res.status(500).render("error", {
+
+
+    res.status(500).render("error", {
         message: "Произошла внутренняя ошибка сервера."
     });
 });
 
+
+// ==========================================
+// ЗАПУСК СЕРВЕРА
+// ==========================================
+
+
 async function startServer() {
     try {
-        if (!process.env.MONGODB_URI) {
-            throw new Error("Не найден MONGODB_URI в файле .env");
+        const required = [
+            "MONGODB_URI",
+            "ADMIN_LOGIN",
+            "ADMIN_HASH",
+            "SESSION_SECRET"
+        ];
+
+
+        const missing = required.filter(
+            key => !process.env[key]
+        );
+
+
+        if (missing.length > 0) {
+            throw new Error(
+                "Не заданы переменные: " + missing.join(", ")
+            );
         }
-        if (!process.env.ADMIN_LOGIN || !process.env.ADMIN_HASH) {
-            throw new Error("Не настроены данные администратора в .env");
-        }
-        if (!process.env.SESSION_SECRET) {
-            throw new Error("Не найден SESSION_SECRET в файле .env");
-        }
+
 
         await db.connect();
-        await migratePlacesSchema();
 
-        app.listen(PORT, () => {
-            console.log(`Сервер запущен: http://localhost:${PORT}`);
-            console.log(`REST API: http://localhost:${PORT}/api/places`);
+
+        app.listen(PORT, "0.0.0.0", () => {
+            console.log(`Сервер запущен на порту ${PORT}`);
         });
+
+
     } catch (error) {
         console.error("Ошибка запуска сервера:", error);
+        process.exit(1);
     }
 }
+
 
 startServer();
